@@ -2,5 +2,6 @@ Sphinx
 sphinxcontrib-fulltoc
 sphinxcontrib-httpdomain
 tornado
+tornado-redis
 celery
 pika

@@ -4,6 +4,9 @@ from __future__ import with_statement
 from datetime import timedelta
 from functools import partial
 
+import asyncio
+import aioredis
+
 from tornado import web
 from tornado import ioloop
 from tornado.escape import json_decode
@@ -29,6 +32,14 @@ class ApplyHandlerBase(web.RequestHandler):
 
         return args, kwargs, options
 
+    async def subscribe_channel(self, ch):
+        conn = await self.application.redis_pool.acquire()
+        await conn.execute_pubsub('subscribe', ch)
+        return conn
+
+    async def unsubscribe_channel(self, conn, ch):
+        await conn.execute_pubsub('unsubscribe', ch)
+        self.application.redis_pool.release(conn)
 
 @route('/apply-async/(.*)/')
 class ApplyAsyncHandler(ApplyHandlerBase):
@@ -171,8 +182,7 @@ Revoke a task
 
 @route('/apply/(.*)/')
 class ApplyHandler(ApplyHandlerBase):
-    @web.asynchronous
-    def post(self, taskname):
+    async def post(self, taskname):
         """
 Apply tasks synchronously. Function returns when the task is finished
 
@@ -229,23 +239,35 @@ Apply tasks synchronously. Function returns when the task is finished
                 timedelta(seconds=timeout),
                 partial(self.on_time, task_id))
 
-        task.apply_async(args=args, kwargs=kwargs, task_id=task_id,
-                         callback=partial(self.on_complete, htimeout),
-                         **options)
+        channel_name = str(task_id)
+        conn = await self.subscribe_channel(channel_name)
+        ch = conn.pubsub_channels[channel_name]
+        assert isinstance(ch, aioredis.Channel)
+        task.apply_async(args=args, kwargs=kwargs, task_id=task_id, **options)
 
-    def on_complete(self, htimeout, result):
+        ret_obj_json = await ch.get(encoding='utf-8')
         if self._finished:
             return
+
+        ret_obj = json_decode(ret_obj_json)
+
+        response = {'task-id': task_id}
+        response['state'] = ret_obj['status']
+        if ret_obj['status'] == 'SUCCESS':
+            response['state'] = ret_obj['status']
+            response['result'] = ret_obj['retval']
+        elif ret_obj['status'] == 'FAILURE':
+            response['state'] = ret_obj['status']
+            response['error'] = ret_obj['retval']
+        else:
+            response['state'] = 'FAILURE'
+            response['error'] = 'UNKOWN_STATE'
+
+        self.unsubscribe_channel(conn, channel_name)
+        self.write(response)
+
         if htimeout:
             ioloop.IOLoop.instance().remove_timeout(htimeout)
-        response = {'task-id': result.task_id, 'state': result.state}
-        if result.successful():
-            response['result'] = result.result
-        else:
-            response['traceback'] = result.traceback
-            response['error'] = repr(result.result)
-        self.write(response)
-        self.finish()
 
     def on_time(self, task_id):
         revoke(task_id)
